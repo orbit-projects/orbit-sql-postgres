@@ -26,7 +26,15 @@ from typing import Protocol, cast
 from uuid import UUID
 
 import asyncpg  # type: ignore[import-untyped]
-from orbit_sql import DatabaseError, SQLExecution, SQLParameters, SQLRow, SQLTransaction, SQLValue
+from orbit_sql import (
+    DatabaseError,
+    SQLExecution,
+    SQLParameters,
+    SQLReadPreference,
+    SQLRow,
+    SQLTransaction,
+    SQLValue,
+)
 
 from orbit_sql_postgres.config import PostgresConfig
 
@@ -83,8 +91,8 @@ class _Connection(Protocol):
     def cursor(self, query: str, *args: SQLValue, prefetch: int) -> _Cursor:
         """Create a transaction-bound cursor."""
 
-    def transaction(self) -> _DriverTransaction:
-        """Create a transaction context for this connection."""
+    def transaction(self, *, readonly: bool = False) -> _DriverTransaction:
+        """Create a transaction context, optionally enforcing PostgreSQL read-only mode."""
 
 
 class _Pool(Protocol):
@@ -101,15 +109,30 @@ class _Pool(Protocol):
 
 
 class PostgresDatabase:
-    """Pooled PostgreSQL access that implements Orbit Core's asynchronous SQL protocol."""
+    """Pooled PostgreSQL access implementing Orbit's asynchronous SQL contract.
 
-    def __init__(self, pool: _Pool, *, close_timeout: float = 10.0) -> None:
+    Standalone statements use asyncpg's normal autocommit behavior. Use
+    :meth:`transaction` when multiple statements must commit or roll back together.
+    Result rows are detached from driver records, and ``fetch_all`` streams only up
+    to the requested limit plus one sentinel row. Call :meth:`aclose` during
+    application shutdown; the registered plugin wires this into Core's lifecycle.
+    """
+
+    def __init__(
+        self,
+        pool: _Pool,
+        *,
+        read_replica_pools: tuple[tuple[_Pool, int], ...] = (),
+        close_timeout: float = 10.0,
+    ) -> None:
         """Wrap an already-open pool; applications should normally use ``open``."""
+        pools = (pool, *(replica for replica, _ in read_replica_pools))
         if any(
-            not callable(getattr(pool, method, None))
+            not callable(getattr(candidate, method, None))
+            for candidate in pools
             for method in ("acquire", "close", "terminate")
         ):
-            raise TypeError("pool must provide callable acquire, close, and terminate methods.")
+            raise TypeError("all PostgreSQL pools must provide acquire, close, and terminate.")
         valid_timeout_type = not isinstance(close_timeout, bool) and isinstance(
             close_timeout, (int, float)
         )
@@ -120,6 +143,20 @@ class PostgresDatabase:
         if not finite_timeout or not 0 < close_timeout <= 300:
             raise ValueError("close_timeout must be finite and between 0 and 300 seconds.")
         self._pool = pool
+        self._read_replica_pools = tuple(read_replica_pools)
+        if any(
+            isinstance(weight, bool) or not isinstance(weight, int) or not 1 <= weight <= 100
+            for _, weight in self._read_replica_pools
+        ):
+            raise ValueError("PostgreSQL read replica weights must be between 1 and 100.")
+        if len(self._read_replica_pools) > 32:
+            raise ValueError("PostgreSQL supports at most 32 configured read replicas.")
+        self._weighted_replica_pools = tuple(
+            candidate
+            for replica, weight in self._read_replica_pools
+            for candidate in (replica,) * weight
+        )
+        self._replica_cursor = 0
         self._close_timeout = float(close_timeout)
         self._loop = asyncio.get_running_loop()
         self._closed = False
@@ -127,9 +164,15 @@ class PostgresDatabase:
 
     @classmethod
     async def open(cls, config: PostgresConfig) -> PostgresDatabase:
-        """Create a bounded asyncpg pool without retaining or exposing the DSN."""
+        """Create a bounded asyncpg pool from validated settings.
+
+        Pool creation performs network I/O. The DSN is passed to asyncpg but is not
+        retained on this wrapper or included in normalized connection errors. TLS
+        verification is enabled by default through :class:`PostgresConfig`.
+        """
         if not isinstance(config, PostgresConfig):
             raise TypeError("config must be a PostgresConfig instance.")
+        created_pools: list[_Pool] = []
         try:
             pool = cast(
                 _Pool,
@@ -142,13 +185,38 @@ class PostgresDatabase:
                     ssl=config.ssl,
                 ),
             )
+            created_pools.append(pool)
+            replica_pools: list[tuple[_Pool, int]] = []
+            for replica in config.read_replicas:
+                replica_pool = cast(
+                    _Pool,
+                    await asyncpg.create_pool(
+                        dsn=replica.dsn.get_secret_value(),
+                        min_size=config.min_pool_size,
+                        max_size=config.max_pool_size,
+                        command_timeout=config.command_timeout,
+                        timeout=config.connect_timeout,
+                        ssl=config.ssl,
+                    ),
+                )
+                created_pools.append(replica_pool)
+                replica_pools.append((replica_pool, replica.weight))
         except asyncio.CancelledError:
+            for created in created_pools:
+                created.terminate()
             raise
         except Exception:
+            for created in created_pools:
+                created.terminate()
             raise DatabaseError(
-                "database.connection-failed", "PostgreSQL connection could not be opened."
+                "database.connection-failed",
+                "PostgreSQL primary and replica pools could not be opened.",
             ) from None
-        return cls(pool, close_timeout=config.close_timeout)
+        return cls(
+            pool,
+            read_replica_pools=tuple(replica_pools),
+            close_timeout=config.close_timeout,
+        )
 
     async def execute(self, statement: str, parameters: SQLParameters = ()) -> SQLExecution:
         """Execute a parameterized PostgreSQL statement and parse its row count."""
@@ -167,13 +235,23 @@ class PostgresDatabase:
                 "database.operation-failed", "PostgreSQL operation failed."
             ) from None
 
-    async def fetch_one(self, statement: str, parameters: SQLParameters = ()) -> SQLRow | None:
-        """Fetch a detached row using PostgreSQL's positional ``$n`` parameters."""
+    async def fetch_one(
+        self,
+        statement: str,
+        parameters: SQLParameters = (),
+        *,
+        read_preference: SQLReadPreference = SQLReadPreference.PRIMARY,
+    ) -> SQLRow | None:
+        """Fetch a detached row, opting into a weighted read-only replica explicitly."""
         self._validate_statement(statement)
         self._validate_parameters(parameters)
         self._ensure_open()
+        pool, read_only = self._pool_for_read(read_preference)
         try:
-            async with self._pool.acquire() as connection:
+            async with pool.acquire() as connection:
+                if read_only:
+                    async with connection.transaction(readonly=True):
+                        return await self._fetch_one_on(connection, statement, parameters)
                 return await self._fetch_one_on(connection, statement, parameters)
         except asyncio.CancelledError:
             raise
@@ -185,17 +263,23 @@ class PostgresDatabase:
             ) from None
 
     async def fetch_all(
-        self, statement: str, parameters: SQLParameters = (), *, limit: int = 1_000
+        self,
+        statement: str,
+        parameters: SQLParameters = (),
+        *,
+        limit: int = 1_000,
+        read_preference: SQLReadPreference = SQLReadPreference.PRIMARY,
     ) -> tuple[SQLRow, ...]:
-        """Stream at most ``limit + 1`` rows and reject oversized result sets."""
+        """Stream a bounded result, optionally through a read-only replica transaction."""
         self._validate_statement(statement)
         self._validate_parameters(parameters)
         self._validate_limit(limit)
         self._ensure_open()
+        pool, read_only = self._pool_for_read(read_preference)
         try:
             # PostgreSQL cursors require an active transaction; this local transaction bounds
             # network reads without buffering the entire result in the process.
-            async with self._pool.acquire() as connection, connection.transaction():
+            async with pool.acquire() as connection, connection.transaction(readonly=read_only):
                 return await self._fetch_all_on(connection, statement, parameters, limit)
         except asyncio.CancelledError:
             raise
@@ -257,10 +341,18 @@ class PostgresDatabase:
         return tuple(_to_sql_row(record) for record in records)
 
     @asynccontextmanager
-    async def transaction(self) -> AsyncIterator[SQLTransaction]:
-        """Pin one pool connection until the transaction commits or rolls back."""
+    async def transaction(
+        self, *, read_preference: SQLReadPreference = SQLReadPreference.PRIMARY
+    ) -> AsyncIterator[SQLTransaction]:
+        """Pin one connection for an atomic transaction scope.
+
+        Normal exit commits. Any exception, including task cancellation, requests a
+        rollback before the connection is released. The yielded transaction object
+        is valid only in the task and scope that created it.
+        """
         self._ensure_open()
-        acquire = self._pool.acquire()
+        pool, read_only = self._pool_for_read(read_preference)
+        acquire = pool.acquire()
         try:
             connection = await acquire.__aenter__()
         except asyncio.CancelledError:
@@ -269,7 +361,7 @@ class PostgresDatabase:
             raise DatabaseError(
                 "database.acquire-failed", "PostgreSQL connection could not be acquired."
             ) from None
-        transaction_context = connection.transaction()
+        transaction_context = connection.transaction(readonly=read_only)
         transaction = _PostgresTransaction(self, connection)
         try:
             try:
@@ -315,26 +407,57 @@ class PostgresDatabase:
                 ) from None
 
     async def aclose(self) -> None:
-        """Drain and close the pool, terminating it when cleanup exceeds its bound."""
+        """Drain and close the pool within ``close_timeout`` seconds.
+
+        Shutdown is idempotent. If the caller cancels shutdown, or the graceful
+        close fails or exceeds its deadline, the pool is terminated so checked-out
+        connections cannot keep the application alive indefinitely.
+        """
         async with self._close_lock:
             if self._closed:
                 return
             self._closed = True
             try:
-                await asyncio.wait_for(self._pool.close(), timeout=self._close_timeout)
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        self._pool.close(),
+                        *(pool.close() for pool, _ in self._read_replica_pools),
+                    ),
+                    timeout=self._close_timeout,
+                )
             except asyncio.CancelledError:
                 self._pool.terminate()
+                for pool, _ in self._read_replica_pools:
+                    pool.terminate()
                 raise
             except TimeoutError:
                 self._pool.terminate()
+                for pool, _ in self._read_replica_pools:
+                    pool.terminate()
                 raise DatabaseError(
-                    "database.close-timeout", "PostgreSQL pool did not drain before shutdown."
+                    "database.close-timeout", "PostgreSQL pools did not drain before shutdown."
                 ) from None
             except Exception:
                 self._pool.terminate()
+                for pool, _ in self._read_replica_pools:
+                    pool.terminate()
                 raise DatabaseError(
-                    "database.close-failed", "PostgreSQL pool could not close cleanly."
+                    "database.close-failed", "PostgreSQL pools could not close cleanly."
                 ) from None
+
+    def _pool_for_read(self, preference: SQLReadPreference) -> tuple[_Pool, bool]:
+        """Select the primary or weighted replica and mark replica work read-only."""
+        if not isinstance(preference, SQLReadPreference):
+            raise ValueError("read_preference must be a SQLReadPreference value.")
+        if preference is SQLReadPreference.PRIMARY:
+            return self._pool, False
+        if not self._weighted_replica_pools:
+            raise DatabaseError(
+                "database.replica-unavailable", "No PostgreSQL read replicas are configured."
+            )
+        pool = self._weighted_replica_pools[self._replica_cursor]
+        self._replica_cursor = (self._replica_cursor + 1) % len(self._weighted_replica_pools)
+        return pool, True
 
     def _ensure_open(self) -> None:
         if asyncio.get_running_loop() is not self._loop:

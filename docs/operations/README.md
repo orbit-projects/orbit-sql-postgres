@@ -17,7 +17,9 @@ stack. It implements `orbit-sql`'s provider-neutral `SQLDatabase` contract for u
 repositories. Core does not define the SQL contract, depend on this package, or install asyncpg.
 
 ```bash
-pip install orbit-core orbit-data orbit-sql orbit-sql-postgres
+pip install orbit-data orbit-sql orbit-sql-postgres
+# Add the Core lifecycle plugin only when the application uses it:
+pip install 'orbit-sql-postgres[core]'
 ```
 
 Configure its typed `PostgresConfig` from a managed secret source. For explicit application-managed
@@ -33,9 +35,28 @@ through the deployment's secret-management mechanism and never commit a credenti
 
 Transactions pin one pooled connection. Cancellation inside a transaction rolls back and releases
 that connection before the cancellation propagates. Pool shutdown has a validated finite deadline;
-if graceful close exceeds it, the pool is terminated. If cancellation or a connection failure
-occurs while a commit is in flight, the final commit outcome may be unknown—do not blindly retry a
-write unless the operation is idempotent or protected by an application-level deduplication key.
+if graceful close exceeds it or shutdown is cancelled, the pool is terminated. If cancellation or a
+connection failure occurs while a commit is in flight, the final commit outcome may be unknown—do
+not blindly retry a write unless the operation is idempotent or protected by an application-level
+deduplication key.
+
+Configure at most 32 `PostgresReadReplica` entries with weights from 1 to 100 and a combined
+maximum pool size of 1,024 connections. Direct reads use the
+primary unless a call explicitly sets `read_preference=SQLReadPreference.REPLICA`; replica calls
+are server-enforced read-only and fail closed when no replicas are configured. Replica failures do
+not cause the statement to be replayed on the primary. Monitor replica lag and remove unhealthy
+replicas from application configuration through a controlled deployment update. Use primary reads
+for read-after-write paths and consistency-sensitive decisions.
+
+```python
+from orbit_sql import SQLReadPreference
+
+rows = await database.fetch_all(
+    "SELECT id, status FROM jobs WHERE status = $1",
+    ("complete",),
+    read_preference=SQLReadPreference.REPLICA,
+)
+```
 
 ```python
 from datetime import UTC, datetime
@@ -78,7 +99,8 @@ from os import environ
 
 from orbit import Application, ApplicationConfig
 from orbit_sql import SQL_DATABASE_KEY
-from orbit_sql_postgres import PostgresConfig, PostgresPlugin
+from orbit_sql_postgres import PostgresConfig
+from orbit_sql_postgres.plugin import PostgresPlugin
 
 application = Application(ApplicationConfig(name="orders"))
 application.register_plugin(PostgresPlugin(PostgresConfig(dsn=environ["ORBIT_POSTGRES_DSN"])))
@@ -94,7 +116,7 @@ The example assumes the `notes` table has already been provisioned; schema migra
 separate capability. Application code depends on `orbit-data`/`orbit-sql` contracts, while the
 PostgreSQL package supplies only the selected SQL provider.
 
-This package is pre-alpha and its API is not stable. It supports Python 3.11 through 3.14. The
+This package is in alpha and its API is not stable. It supports Python 3.11 through 3.14. The
 default suite uses a fake asyncpg pool; an opt-in live check exercises query execution, bounded
 cursor iteration, transaction rollback, and cleanup against a disposable PostgreSQL database. It
 creates and removes only a uniquely named table. Remote databases are skipped unless explicitly

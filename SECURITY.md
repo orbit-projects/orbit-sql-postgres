@@ -4,4 +4,4 @@ Do not publish vulnerability details in public issues. If private vulnerability 
 
 Include the affected package version or commit, affected component, technical impact, a safe reproduction, and any mitigation identified. Redact credentials, personal data, private keys, and production endpoints. Do not attach production data.
 
-This package is pre-alpha and has no stable-release or response-time commitment. Maintainers assess reports for the current development branch and any published versions they identify as supported. The package's provider-neutral contracts do not certify the security of provider SDKs, service configurations, or deployment environments.
+This package is in alpha and has no stable-release or response-time commitment. Maintainers assess reports for the current development branch and any published versions they identify as supported. The package's provider-neutral contracts do not certify the security of provider SDKs, service configurations, or deployment environments.

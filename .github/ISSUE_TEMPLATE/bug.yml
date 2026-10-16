@@ -1,0 +1,28 @@
+name: Bug report
+description: Report reproducible behavior in orbit-sql-postgres.
+body:
+  - type: markdown
+    attributes:
+      value: Do not include secrets, customer data, or private endpoint details.
+  - type: input
+    id: version
+    attributes:
+      label: Orbit package version or commit
+      description: Include the released version or the commit you tested.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide a minimal example, expected result, and actual result.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include runtime, operating system, provider or service version, and relevant configuration names (never secret values).
+    validations:
+      required: true

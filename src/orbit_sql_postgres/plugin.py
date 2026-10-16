@@ -13,11 +13,11 @@
 # limitations under the License.
 """Optional Orbit plugin wiring the PostgreSQL provider into Core's SQL capability."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 
 from orbit import Application
-from orbit.plugins import Plugin, PluginMetadata
+from orbit.plugins import ControlAction, ControlResult, Plugin, PluginMetadata
 from orbit_sql import SQL_DATABASE_KEY
 
 from orbit_sql_postgres.config import PostgresConfig
@@ -42,6 +42,14 @@ class PostgresPlugin(Plugin):
         if not isinstance(config, PostgresConfig):
             raise TypeError("PostgresPlugin requires PostgresConfig.")
         self._config = config
+        self.control_actions = (
+            ControlAction(
+                id="check-connection",
+                title="Check PostgreSQL database",
+                description="Run a read-only SELECT 1 against a temporary bounded pool.",
+                handler=self._check_connection,
+            ),
+        )
 
     def setup(self, application: Application) -> None:
         """Register the SQL adapter as a lazily acquired Core container resource."""
@@ -57,6 +65,12 @@ class PostgresPlugin(Plugin):
             yield database
         finally:
             await database.aclose()
+
+    async def _check_connection(self, _: Mapping[str, object]) -> ControlResult:
+        """Run a read-only connectivity query and close all temporary pool resources."""
+        async with self._database() as database:
+            await database.fetch_one("SELECT 1")
+        return ControlResult("PostgreSQL database is reachable.")
 
 
 __all__ = ["PostgresPlugin"]

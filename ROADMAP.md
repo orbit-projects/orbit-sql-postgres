@@ -1,6 +1,6 @@
 # Orbit SQL PostgreSQL roadmap
 
-This package is pre-alpha. Roadmap direction is evidence-driven and has no dated delivery promises. The current implemented scope is the package [README](README.md), [architecture guide](docs/architecture/overview.md), and source tree; the package name alone does not imply an implemented integration or feature.
+This package is alpha. Roadmap direction is evidence-driven and has no dated delivery promises. The current implemented scope is the package [README](README.md), [architecture guide](docs/architecture/overview.md), and source tree; the package name alone does not imply an implemented integration or feature.
 
 ## Priorities
 

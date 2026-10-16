@@ -18,6 +18,15 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictBool, model_validator
 
 
+class PostgresReadReplica(BaseModel):
+    """Connection and selection weight for one PostgreSQL read replica."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    dsn: SecretStr = Field(min_length=1, max_length=2_048)
+    weight: int = Field(default=1, ge=1, le=100, strict=True)
+
+
 class PostgresConfig(BaseModel):
     """Provider-specific connection settings with TLS enabled by default."""
 
@@ -30,13 +39,18 @@ class PostgresConfig(BaseModel):
     connect_timeout: float = Field(default=10.0, gt=0, le=300, allow_inf_nan=False, strict=True)
     close_timeout: float = Field(default=10.0, gt=0, le=300, allow_inf_nan=False, strict=True)
     ssl: StrictBool = True
+    read_replicas: tuple[PostgresReadReplica, ...] = Field(default=(), max_length=32)
 
     @model_validator(mode="after")
     def validate_pool_bounds(self) -> PostgresConfig:
-        """Require an ordered pool range before handing settings to asyncpg."""
+        """Bound each pool and the combined maximum connections across every endpoint."""
         if self.min_pool_size > self.max_pool_size:
             raise ValueError("min_pool_size must not exceed max_pool_size.")
+        if self.max_pool_size * (1 + len(self.read_replicas)) > 1_024:
+            raise ValueError(
+                "combined primary and replica max_pool_size must not exceed 1,024 connections."
+            )
         return self
 
 
-__all__ = ["PostgresConfig"]
+__all__ = ["PostgresConfig", "PostgresReadReplica"]

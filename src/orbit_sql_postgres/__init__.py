@@ -14,8 +14,7 @@
 """PostgreSQL provider adapter for Orbit SQL."""
 
 from orbit_sql_postgres.adapter import PostgresAdapter
-from orbit_sql_postgres.config import PostgresConfig
+from orbit_sql_postgres.config import PostgresConfig, PostgresReadReplica
 from orbit_sql_postgres.database import PostgresDatabase
-from orbit_sql_postgres.plugin import PostgresPlugin
 
-__all__ = ["PostgresAdapter", "PostgresConfig", "PostgresDatabase", "PostgresPlugin"]
+__all__ = ["PostgresAdapter", "PostgresConfig", "PostgresDatabase", "PostgresReadReplica"]

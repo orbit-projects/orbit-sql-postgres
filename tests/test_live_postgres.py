@@ -34,9 +34,7 @@ async def test_live_postgres_queries_transaction_rollback_and_cleanup() -> None:
     host = urlsplit(dsn).hostname
     local = host in {"localhost", "127.0.0.1", "::1"}
     if not local and os.environ.get("ORBIT_POSTGRES_ALLOW_REMOTE_TESTS") != "1":
-        pytest.skip(
-            "Set ORBIT_POSTGRES_ALLOW_REMOTE_TESTS=1 to target a non-local test database."
-        )
+        pytest.skip("Set ORBIT_POSTGRES_ALLOW_REMOTE_TESTS=1 to target a non-local test database.")
 
     database = await PostgresDatabase.open(PostgresConfig(dsn=dsn, ssl=not local))
     table = f"orbit_live_{uuid4().hex}"
@@ -58,15 +56,11 @@ async def test_live_postgres_queries_transaction_rollback_and_cleanup() -> None:
                 )
                 raise RuntimeError("rollback sentinel")
 
-        row = await database.fetch_one(
-            f"SELECT id, value FROM {quoted_table} WHERE id = $1", (1,)
-        )
+        row = await database.fetch_one(f"SELECT id, value FROM {quoted_table} WHERE id = $1", (1,))
         rows = await database.fetch_all(
             f"SELECT id, value FROM {quoted_table} ORDER BY id", limit=10
         )
-        rolled_back = await database.fetch_one(
-            f"SELECT id FROM {quoted_table} WHERE id = $1", (2,)
-        )
+        rolled_back = await database.fetch_one(f"SELECT id FROM {quoted_table} WHERE id = $1", (2,))
         assert row is not None and dict(row) == {"id": 1, "value": "committed"}
         assert tuple(dict(result) for result in rows) == ({"id": 1, "value": "committed"},)
         assert rolled_back is None

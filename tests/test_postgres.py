@@ -14,8 +14,10 @@
 """Contract tests for the PostgreSQL adapter using an isolated fake asyncpg pool."""
 
 import asyncio
+import tomllib
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from uuid import UUID
 
 import asyncpg
@@ -28,20 +30,32 @@ from orbit_sql import (
     SQLAdapterRegistry,
     SQLDatabase,
     SQLExecution,
+    SQLReadPreference,
     SQLRepository,
     SQLUnitOfWork,
 )
 from pydantic import BaseModel, SecretStr, ValidationError
 
-from orbit_sql_postgres import PostgresAdapter, PostgresConfig, PostgresPlugin
+from orbit_sql_postgres import PostgresAdapter, PostgresConfig
 from orbit_sql_postgres.database import PostgresDatabase
+from orbit_sql_postgres.plugin import PostgresPlugin
+
+
+def test_core_lifecycle_dependency_is_optional() -> None:
+    """The SQL provider can be used without Core unless its plugin extra is installed."""
+    manifest = tomllib.loads(
+        (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]
+    assert not any(dep.startswith("orbit-core") for dep in manifest["dependencies"])
+    assert manifest["optional-dependencies"]["core"] == ["orbit-core>=0.1.0a1,<0.2"]
 
 
 class _FakeTransaction:
     """Record transaction lifecycle calls without a database server."""
 
-    def __init__(self, connection):
+    def __init__(self, connection, *, readonly=False):
         self.connection = connection
+        self.connection.transaction_readonly.append(readonly)
 
     async def start(self):
         self.connection.started += 1
@@ -93,6 +107,7 @@ class _FakeConnection:
         self.cursor_instance = None
         self.released = 0
         self.commit_error = None
+        self.transaction_readonly = []
 
     async def execute(self, statement, *parameters):
         self.statement = statement
@@ -110,8 +125,8 @@ class _FakeConnection:
         self.cursor_instance = _FakeCursor(self.records)
         return self.cursor_instance
 
-    def transaction(self):
-        return _FakeTransaction(self)
+    def transaction(self, *, readonly=False):
+        return _FakeTransaction(self, readonly=readonly)
 
 
 class _Acquire:
@@ -193,6 +208,34 @@ async def test_adapter_registers_and_maps_common_scalar_values(fake_pool) -> Non
         await database.aclose()
 
 
+def test_postgres_replica_configuration_is_bounded_and_secret_aware() -> None:
+    """Replica DSNs remain secret and replica count/weights have finite bounds."""
+    from orbit_sql_postgres import PostgresReadReplica
+
+    config = PostgresConfig(
+        dsn="postgresql://primary:secret@db/app",
+        read_replicas=(PostgresReadReplica(dsn="postgresql://replica:secret@db/app", weight=3),),
+    )
+    assert "secret" not in repr(config.read_replicas)
+    with pytest.raises(ValidationError):
+        PostgresReadReplica(dsn="postgresql://replica/db", weight=101)
+    with pytest.raises(ValidationError):
+        PostgresConfig(
+            dsn="postgresql://primary/db",
+            read_replicas=tuple(
+                PostgresReadReplica(dsn=f"postgresql://replica-{index}/db") for index in range(33)
+            ),
+        )
+    with pytest.raises(ValidationError, match="1,024 connections"):
+        PostgresConfig(
+            dsn="postgresql://primary/db",
+            max_pool_size=32,
+            read_replicas=tuple(
+                PostgresReadReplica(dsn=f"postgresql://replica-{index}/db") for index in range(32)
+            ),
+        )
+
+
 async def test_core_sql_repository_and_postgres_adapter_compose(fake_pool) -> None:
     """The provider leaf plugs into Core SQL and orbit-sql without a vendor-facing repository."""
     pool, _observed = fake_pool
@@ -259,6 +302,19 @@ async def test_postgres_plugin_registers_lazy_resource_and_core_closes_it(fake_p
     assert pool.terminated == 0
 
 
+async def test_postgres_plugin_contributes_a_read_only_control_room_check(fake_pool) -> None:
+    """The CLI action checks connectivity and closes its short-lived pool."""
+    pool, _observed = fake_pool
+    plugin = PostgresPlugin(PostgresConfig(dsn="postgresql://user:secret@localhost/app"))
+
+    result = await plugin.control_actions[0].handler({})
+
+    assert result is not None
+    assert result.summary == "PostgreSQL database is reachable."
+    assert pool.closed == 1
+    assert pool.terminated == 0
+
+
 async def test_fetch_all_bounds_cursor_iteration_and_errors_on_excess(fake_pool) -> None:
     """PostgreSQL reads at most one sentinel row above the caller's limit."""
     _pool, _observed = fake_pool
@@ -271,6 +327,62 @@ async def test_fetch_all_bounds_cursor_iteration_and_errors_on_excess(fake_pool)
     assert caught.value.code == "database.result-limit"
     assert _pool.connection.cursor_instance.requested == 2
     await database.aclose()
+
+
+async def test_replica_reads_use_weighted_pools_and_read_only_transactions() -> None:
+    """Explicit replica reads round-robin by weight and never fall back to primary."""
+    primary_connection = _FakeConnection()
+    replica_one_connection = _FakeConnection()
+    replica_two_connection = _FakeConnection()
+    primary = _FakePool(primary_connection)
+    replica_one = _FakePool(replica_one_connection)
+    replica_two = _FakePool(replica_two_connection)
+    database = PostgresDatabase(
+        primary,
+        read_replica_pools=((replica_one, 1), (replica_two, 2)),
+    )
+    try:
+        for _ in range(3):
+            await database.fetch_one("SELECT 1", read_preference=SQLReadPreference.REPLICA)
+        assert replica_one_connection.statement == "SELECT 1"
+        assert replica_two_connection.statement == "SELECT 1"
+        assert replica_one_connection.transaction_readonly == [True]
+        assert replica_two_connection.transaction_readonly == [True, True]
+        assert not hasattr(primary_connection, "statement")
+        with pytest.raises(ValueError):
+            await database.fetch_one("SELECT 1", read_preference="replica")
+    finally:
+        await database.aclose()
+    assert primary.closed == replica_one.closed == replica_two.closed == 1
+
+
+async def test_replica_preference_fails_closed_when_no_replica_is_configured() -> None:
+    """Replica intent never silently routes to primary when replica configuration is absent."""
+    connection = _FakeConnection()
+    pool = _FakePool(connection)
+    database = PostgresDatabase(pool)
+    try:
+        with pytest.raises(DatabaseError) as caught:
+            await database.fetch_one("SELECT 1", read_preference=SQLReadPreference.REPLICA)
+        assert caught.value.code == "database.replica-unavailable"
+        assert not hasattr(connection, "statement")
+    finally:
+        await database.aclose()
+
+
+async def test_replica_transactions_request_read_only_mode() -> None:
+    """A replica transaction is server-enforced read-only, including arbitrary SQL strings."""
+    primary = _FakePool(_FakeConnection())
+    replica_connection = _FakeConnection()
+    replica = _FakePool(replica_connection)
+    database = PostgresDatabase(primary, read_replica_pools=((replica, 1),))
+    try:
+        async with database.transaction(read_preference=SQLReadPreference.REPLICA) as transaction:
+            await transaction.fetch_one("SELECT 1")
+        assert replica_connection.transaction_readonly == [True]
+        assert not hasattr(primary.connection, "statement")
+    finally:
+        await database.aclose()
 
 
 async def test_transaction_commits_and_rolls_back_user_exceptions(fake_pool) -> None:
@@ -417,6 +529,30 @@ async def test_pool_close_timeout_terminates_and_remains_idempotent(fake_pool, m
     with pytest.raises(DatabaseError) as caught:
         await database.aclose()
     assert caught.value.code == "database.close-timeout"
+    assert pool.terminated == 1
+    await database.aclose()
+    assert pool.terminated == 1
+
+
+async def test_pool_close_cancellation_terminates_and_remains_idempotent(
+    fake_pool, monkeypatch
+) -> None:
+    """Caller cancellation cannot leave a half-closed pool running in the background."""
+    pool, _observed = fake_pool
+    database = PostgresDatabase(pool, close_timeout=1)
+    closing = asyncio.Event()
+
+    async def stalled_close() -> None:
+        closing.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(pool, "close", stalled_close)
+    task = asyncio.create_task(database.aclose())
+    await closing.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
     assert pool.terminated == 1
     await database.aclose()
     assert pool.terminated == 1
